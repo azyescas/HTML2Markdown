@@ -1,111 +1,132 @@
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
+import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
+import java.net.SocketTimeoutException;
+import java.net.URL;
+import java.net.URLConnection;
+import java.net.UnknownHostException;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.text.NumberFormat;
+import java.util.Locale;
 
 public class HTML2Markdown {
 
     public static void main(String[] args) {
-        if (args.length < 1) {
-            System.out.println("Uso: java HTML2Markdown <url> [archivo_salida.md]");
+        if (args.length < 1 || args[0].isBlank()) {
+            System.err.println("Error: Debe proporcionar una URL.");
+            System.err.println("Uso: java HTML2Markdown <url> [archivo_salida.md]");
             return;
         }
 
-        String url = args[0];
-        String rutaSalida = (args.length > 1) ? args[1] : obtenerNombrePorDefecto(url);
+        String urlTexto = args[0].trim();
 
-        try {
-            String html = descargarHtml(url);
-            String markdown = convertirHtmlAMarkdown(html);
-            guardarArchivo(rutaSalida, markdown);
-            System.out.println("Archivo guardado en: " + Paths.get(rutaSalida).toAbsolutePath());
-        } catch (Exception e) {
-            System.err.println("Error al procesar: " + e.getMessage());
-        }
-    }
+        System.out.println("HTML2Markdown");
+        System.out.println("--------------------------------");
+        System.out.println("URL: " + urlTexto);
+        System.out.println();
 
-    private static String obtenerNombrePorDefecto(String url) {
+        URL url;
         try {
-            String path = URI.create(url).getPath();
-            if (path != null && !path.isBlank()) {
-                String nombre = Paths.get(path).getFileName().toString();
-                int punto = nombre.lastIndexOf('.');
-                if (punto > 0) {
-                    nombre = nombre.substring(0, punto);
-                }
-                return nombre + ".md";
+            url = new URL(urlTexto);
+            String protocolo = url.getProtocol();
+            if (protocolo == null || (!protocolo.equalsIgnoreCase("http") && !protocolo.equalsIgnoreCase("https"))) {
+                System.err.println("Error: URL invalida. Solo se admiten protocolos http o https.");
+                return;
             }
-        } catch (Exception ignored) {
+            if (url.getHost() == null || url.getHost().isBlank()) {
+                System.err.println("Error: URL invalida. Falta el nombre del servidor/host.");
+                return;
+            }
+        } catch (MalformedURLException e) {
+            System.err.println("Error: URL invalida -> " + e.getMessage());
+            return;
         }
-        return "output/articulo.md";
+
+        System.out.println("Conectando con el servidor...");
+        int codigoHttp = obtenerCodigoEstadoHttp(url);
+        if (codigoHttp > 0) {
+            System.out.println("Respuesta HTTP: " + codigoHttp);
+        }
+
+        WebClient client = new WebClient();
+        MarkdownConverter converter = new MarkdownConverter();
+        MarkdownWriter writer = new MarkdownWriter();
+
+        String html;
+        try {
+            html = client.descargarHTML(url);
+        } catch (UnknownHostException e) {
+            System.err.println("Error: Servidor inaccesible. No se pudo resolver el host '" + url.getHost() + "'.");
+            return;
+        } catch (SocketTimeoutException e) {
+            System.err.println("Error: Tiempo de espera agotado al conectar o leer desde el servidor.");
+            return;
+        } catch (IOException e) {
+            String msg = e.getMessage() != null ? e.getMessage() : "";
+            if (msg.toLowerCase().contains("no es html") || msg.toLowerCase().contains("content-type")) {
+                System.err.println("Error: Contenido no HTML -> " + msg);
+            } else if (msg.toLowerCase().contains("respuesta http")) {
+                System.err.println("Error: Respuesta HTTP no exitosa -> " + msg);
+            } else {
+                System.err.println("Error de conexion o descarga -> " + msg);
+            }
+            return;
+        }
+
+        System.out.println();
+        System.out.println("Analizando HTML...");
+        System.out.println("Convirtiendo a Markdown...");
+
+        String markdown;
+        try {
+            markdown = converter.convertir(html, url);
+        } catch (Exception e) {
+            System.err.println("Error al analizar o convertir el HTML a Markdown: " + e.getMessage());
+            return;
+        }
+
+        Path destino = (args.length > 1 && !args[1].isBlank())
+                ? Paths.get(args[1].trim())
+                : writer.resolverDestinoPredeterminado(url);
+
+        try {
+            writer.guardar(destino, markdown);
+            long tamanoBytes = Files.size(destino);
+            String tamanoFormateado = NumberFormat.getIntegerInstance(Locale.US).format(tamanoBytes);
+
+            System.out.println();
+            System.out.println("Archivo generado: " + destino);
+            System.out.println("Tamano: " + tamanoFormateado + " bytes");
+            System.out.println();
+            System.out.println("Conversion finalizada.");
+        } catch (AccessDeniedException e) {
+            System.err.println("Error de escritura: Permiso denegado al escribir en '" + destino + "'.");
+        } catch (IOException e) {
+            System.err.println("Error de escritura: No se pudo guardar el archivo en '" + destino + "' -> " + e.getMessage());
+        }
     }
 
-    private static String descargarHtml(String url) throws IOException, InterruptedException {
-        HttpClient client = HttpClient.newHttpClient();
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .GET()
-                .build();
-
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new IOException("HTTP " + response.statusCode() + " al consultar " + url);
+    private static int obtenerCodigoEstadoHttp(URL url) {
+        HttpURLConnection conn = null;
+        try {
+            URLConnection rawConn = url.openConnection();
+            if (rawConn instanceof HttpURLConnection) {
+                conn = (HttpURLConnection) rawConn;
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(10_000);
+                conn.setReadTimeout(10_000);
+                conn.setRequestMethod("GET");
+                return conn.getResponseCode();
+            }
+        } catch (IOException ignored) {
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
-        return response.body();
-    }
-
-    private static String convertirHtmlAMarkdown(String html) {
-        String md = html;
-
-        // Encabezados
-        md = md.replaceAll("(?is)<h1[^>]*>(.*?)</h1>", "# $1\n\n");
-        md = md.replaceAll("(?is)<h2[^>]*>(.*?)</h2>", "## $1\n\n");
-        md = md.replaceAll("(?is)<h3[^>]*>(.*?)</h3>", "### $1\n\n");
-
-        // Negritas
-        md = md.replaceAll("(?is)<(?:strong|b)[^>]*>(.*?)</(?:strong|b)>", "**$1**");
-
-        // Enlaces <a href="...">texto</a>
-        Matcher linkMatcher = Pattern.compile("(?is)<a\\s+[^>]*href=[\"']([^\"']*)[\"'][^>]*>(.*?)</a>").matcher(md);
-        StringBuffer sbLinks = new StringBuffer();
-        while (linkMatcher.find()) {
-            String href = linkMatcher.group(1).trim();
-            String texto = linkMatcher.group(2).replaceAll("(?s)<[^>]+>", "").trim();
-            linkMatcher.appendReplacement(sbLinks, Matcher.quoteReplacement("[" + texto + "](" + href + ")"));
-        }
-        linkMatcher.appendTail(sbLinks);
-        md = sbLinks.toString();
-
-        // Elementos de lista <li>
-        md = md.replaceAll("(?is)<li[^>]*>(.*?)</li>", "- $1\n");
-        md = md.replaceAll("(?is)</?ul[^>]*>", "\n");
-
-        // Párrafos
-        md = md.replaceAll("(?is)<p[^>]*>(.*?)</p>", "$1\n\n");
-
-        // Limpiar etiquetas HTML restantes y normalizar espacios/saltos
-        md = md.replaceAll("(?s)<[^>]+>", "");
-        md = md.replace("&nbsp;", " ");
-        md = md.replaceAll("[ \\t]+", " ");
-        md = md.replaceAll(" ?\n ?", "\n");
-        md = md.replaceAll("\n{3,}", "\n\n").trim() + "\n";
-
-        return md;
-    }
-
-    private static void guardarArchivo(String rutaSalida, String contenido) throws IOException {
-        Path destino = Paths.get(rutaSalida);
-        Path carpetaPadre = destino.getParent();
-        if (carpetaPadre != null) {
-            Files.createDirectories(carpetaPadre);
-        }
-        Files.writeString(destino, contenido, StandardCharsets.UTF_8);
+        return -1;
     }
 }
