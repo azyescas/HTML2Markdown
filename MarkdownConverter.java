@@ -5,12 +5,38 @@ import java.net.URI;
 import java.net.URL;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.HashMap;
+import java.util.Map;
 import javax.swing.text.MutableAttributeSet;
 import javax.swing.text.html.HTML;
 import javax.swing.text.html.HTMLEditorKit;
 import javax.swing.text.html.parser.ParserDelegator;
 
 public class MarkdownConverter {
+
+    private static final Map<String, String> ENTIDADES_HTML = new HashMap<>();
+
+    static {
+        ENTIDADES_HTML.put("&amp;", "&");
+        ENTIDADES_HTML.put("&lt;", "<");
+        ENTIDADES_HTML.put("&gt;", ">");
+        ENTIDADES_HTML.put("&quot;", "\"");
+        ENTIDADES_HTML.put("&#39;", "'");
+        ENTIDADES_HTML.put("&apos;", "'");
+        ENTIDADES_HTML.put("&nbsp;", " ");
+        ENTIDADES_HTML.put("&aacute;", "á");
+        ENTIDADES_HTML.put("&eacute;", "é");
+        ENTIDADES_HTML.put("&iacute;", "í");
+        ENTIDADES_HTML.put("&oacute;", "ó");
+        ENTIDADES_HTML.put("&uacute;", "ú");
+        ENTIDADES_HTML.put("&Aacute;", "Á");
+        ENTIDADES_HTML.put("&Eacute;", "É");
+        ENTIDADES_HTML.put("&Iacute;", "Í");
+        ENTIDADES_HTML.put("&Oacute;", "Ó");
+        ENTIDADES_HTML.put("&Uacute;", "Ú");
+        ENTIDADES_HTML.put("&ntilde;", "ñ");
+        ENTIDADES_HTML.put("&Ntilde;", "Ñ");
+    }
 
     private static class ListaContexto {
         final boolean ordenada;
@@ -27,6 +53,8 @@ public class MarkdownConverter {
 
         HTMLEditorKit.ParserCallback callback = new HTMLEditorKit.ParserCallback() {
             private final Deque<ListaContexto> listas = new ArrayDeque<>();
+            private boolean enScript = false;
+            private boolean enStyle = false;
             private boolean enCodigo = false;
             private boolean enPre = false;
             private boolean enEnlace = false;
@@ -36,15 +64,22 @@ public class MarkdownConverter {
 
             @Override
             public void handleStartTag(HTML.Tag t, MutableAttributeSet a, int pos) {
-                if (t == HTML.Tag.H1) {
+                if (t == HTML.Tag.SCRIPT) {
+                    enScript = true;
+                    return;
+                }
+                if (t == HTML.Tag.STYLE) {
+                    enStyle = true;
+                    return;
+                }
+                if (enScript || enStyle) {
+                    return;
+                }
+
+                String nivelEncabezado = prefijoEncabezado(t);
+                if (nivelEncabezado != null) {
                     asegurarSaltoBloque(out);
-                    out.append("# ");
-                } else if (t == HTML.Tag.H2) {
-                    asegurarSaltoBloque(out);
-                    out.append("## ");
-                } else if (t == HTML.Tag.H3) {
-                    asegurarSaltoBloque(out);
-                    out.append("### ");
+                    out.append(nivelEncabezado).append(" ");
                 } else if (t == HTML.Tag.STRONG || t == HTML.Tag.B) {
                     destinoActual().append("**");
                 } else if (t == HTML.Tag.EM || t == HTML.Tag.I) {
@@ -85,6 +120,9 @@ public class MarkdownConverter {
 
             @Override
             public void handleSimpleTag(HTML.Tag t, MutableAttributeSet a, int pos) {
+                if (enScript || enStyle) {
+                    return;
+                }
                 if (t == HTML.Tag.BR) {
                     destinoActual().append("  \n");
                 } else if (t == HTML.Tag.HR) {
@@ -94,7 +132,8 @@ public class MarkdownConverter {
                     Object src = a.getAttribute(HTML.Attribute.SRC);
                     if (src != null && !src.toString().isBlank()) {
                         Object alt = a.getAttribute(HTML.Attribute.ALT);
-                        String textoAlt = (alt != null) ? escaparMarkdown(alt.toString().trim()) : "imagen";
+                        String altLimpio = (alt != null) ? decodificarEntidades(alt.toString().trim()) : "";
+                        String textoAlt = escaparMarkdown(altLimpio);
                         String urlResuelta = resolverReferencia(urlBase, src.toString().trim());
                         destinoActual().append("![").append(textoAlt).append("](").append(urlResuelta).append(")");
                     }
@@ -103,7 +142,11 @@ public class MarkdownConverter {
 
             @Override
             public void handleText(char[] data, int pos) {
-                String texto = new String(data);
+                if (enScript || enStyle) {
+                    return;
+                }
+
+                String texto = decodificarEntidades(new String(data));
                 if (enPre) {
                     bloquePre.append(texto);
                     return;
@@ -126,7 +169,19 @@ public class MarkdownConverter {
 
             @Override
             public void handleEndTag(HTML.Tag t, int pos) {
-                if (t == HTML.Tag.H1 || t == HTML.Tag.H2 || t == HTML.Tag.H3 || t == HTML.Tag.P) {
+                if (t == HTML.Tag.SCRIPT) {
+                    enScript = false;
+                    return;
+                }
+                if (t == HTML.Tag.STYLE) {
+                    enStyle = false;
+                    return;
+                }
+                if (enScript || enStyle) {
+                    return;
+                }
+
+                if (prefijoEncabezado(t) != null || t == HTML.Tag.P) {
                     asegurarSaltoBloque(out);
                 } else if (t == HTML.Tag.STRONG || t == HTML.Tag.B) {
                     destinoActual().append("**");
@@ -169,10 +224,30 @@ public class MarkdownConverter {
             delegator.parse(reader, callback, true);
         }
 
-        return out.toString()
+        String resultado = out.toString()
                 .replaceAll(" *\n", "\n")
                 .replaceAll("\n{3,}", "\n\n")
-                .trim() + "\n";
+                .trim();
+
+        return resultado.isEmpty() ? "" : resultado + "\n";
+    }
+
+    private static String prefijoEncabezado(HTML.Tag t) {
+        if (t == HTML.Tag.H1) return "#";
+        if (t == HTML.Tag.H2) return "##";
+        if (t == HTML.Tag.H3) return "###";
+        if (t == HTML.Tag.H4) return "####";
+        if (t == HTML.Tag.H5) return "#####";
+        if (t == HTML.Tag.H6) return "######";
+        return null;
+    }
+
+    private static String decodificarEntidades(String texto) {
+        String res = texto;
+        for (Map.Entry<String, String> entry : ENTIDADES_HTML.entrySet()) {
+            res = res.replace(entry.getKey(), entry.getValue());
+        }
+        return res;
     }
 
     private static String resolverReferencia(URL urlBase, String referencia) {
@@ -191,6 +266,7 @@ public class MarkdownConverter {
     }
 
     private static String escaparMarkdown(String texto) {
+        // Escapa caracteres especiales de Markdown en texto normal sin romper delimitadores generados
         return texto.replaceAll("([\\\\`*_{}\\[\\]()#+\\-.!])", "\\\\$1");
     }
 
